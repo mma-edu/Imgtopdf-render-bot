@@ -1,85 +1,110 @@
 const { Telegraf } = require('telegraf');
 const sharp = require('sharp');
 const PDFDocument = require('pdfkit');
-const fetch = require('node-fetch');
-const express = require('express'); // Added for Render compatibility
+const axios = require('axios'); // Replaced node-fetch with axios
+const express = require('express');
 
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Enhanced error handling for Render
+// ======================
+// 1. INITIALIZATION CHECKS
+// ======================
 if (!process.env.BOT_TOKEN) {
-  console.error("❌ FATAL: Missing BOT_TOKEN");
+  console.error("❌ Missing BOT_TOKEN");
   process.exit(1);
 }
 
-// Improved session storage with 50-image limit
+// ======================
+// 2. SESSION MANAGEMENT
+// ======================
 const userSessions = {};
-const MAX_IMAGES_PER_USER = 50;
+const MAX_IMAGES = 50;
 
-// Middleware with memory leak protection
 bot.use(async (ctx, next) => {
   if (!ctx.from) return next();
   
   const userId = ctx.from.id;
   if (!userSessions[userId]) {
-    userSessions[userId] = { 
-      images: [],
-      lastActivity: Date.now()
-    };
+    userSessions[userId] = { images: [] };
   }
   
-  // Auto-clean old sessions (Render has limited memory)
-  if (Date.now() - userSessions[userId].lastActivity > 86400000) { // 24h
+  // Auto-clean old sessions (24h)
+  if (userSessions[userId].timestamp && Date.now() - userSessions[userId].timestamp > 86400000) {
     delete userSessions[userId];
-    return ctx.reply("⌛ Your session expired. Send /start to begin.");
+    return ctx.reply("⌛ Session expired. Send /start");
   }
-  
+
   ctx.session = userSessions[userId];
-  ctx.session.lastActivity = Date.now();
+  ctx.session.timestamp = Date.now();
   await next();
 });
 
-// Commands (unchanged from your Vercel version)
+// ======================
+// 3. BOT COMMANDS
+// ======================
 bot.command('start', (ctx) => {
-  ctx.reply("📸➡️📄 *Image to PDF Bot*\n\nSend me images (JPEG/PNG) and I'll convert them to PDF!\n\n• Max 50 images\n• /convert when ready\n• /cancel to clear", { parse_mode: 'Markdown' });
+  ctx.reply(
+    "📸➡️📄 *Image to PDF Bot*\n\n" +
+    "Send me images (JPEG/PNG) to convert to PDF!\n\n" +
+    "• Max 50 images\n• /convert when ready\n• /cancel to clear",
+    { parse_mode: 'Markdown' }
+  );
 });
 
-bot.command('help', (ctx) => {
-  ctx.reply("🆘 *How to use:*\n1. Send images\n2. Type /convert\n3. Get PDF\n\nMax 50 images", { parse_mode: 'Markdown' });
-});
-
+bot.command('help', (ctx) => ctx.reply("Send images → /convert → Get PDF\nMax 50 images", { parse_mode: 'Markdown' }));
 bot.command('cancel', (ctx) => {
   ctx.session.images = [];
   ctx.reply("🗑️ Cleared all images!");
 });
 
-// Image processing with Render-specific optimizations
-async function processImage(ctx, file) {
-  if (ctx.session.images.length >= MAX_IMAGES_PER_USER) {
-    return ctx.reply(`⚠️ Maximum ${MAX_IMAGES_PER_USER} images reached. Use /convert now.`);
-  }
+// ======================
+// 4. IMAGE PROCESSING
+// ======================
+async function downloadImage(url) {
+  const response = await axios.get(url, { responseType: 'arraybuffer' });
+  return Buffer.from(response.data, 'binary');
+}
 
+async function processImage(ctx, file) {
   try {
+    if (ctx.session.images.length >= MAX_IMAGES) {
+      return ctx.reply(`⚠️ Max ${MAX_IMAGES} images reached. Use /convert now.`);
+    }
+
     const fileUrl = await ctx.telegram.getFileLink(file.file_id);
-    const response = await fetch(fileUrl);
-    const imageBuffer = await response.buffer();
+    const imageBuffer = await downloadImage(fileUrl.href);
     
-    // Render-specific: Downscale images to prevent OOM errors
     const processedImage = await sharp(imageBuffer)
-      .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
+      .resize(1200, 1200, { fit: 'inside' })
       .jpeg({ quality: 85 })
       .toBuffer();
 
     ctx.session.images.push(processedImage);
-    ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES_PER_USER})`);
+    ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES})`);
   } catch (error) {
-    console.error("Image processing failed:", error);
+    console.error("Image error:", error);
     ctx.reply("❌ Failed to process image. Try another file.");
   }
 }
 
-// PDF generation with Render memory constraints
+bot.on('photo', async (ctx) => {
+  await processImage(ctx, ctx.message.photo.pop());
+});
+
+bot.on('document', async (ctx) => {
+  const doc = ctx.message.document;
+  const validTypes = ['image/jpeg', 'image/png'];
+  if (validTypes.includes(doc.mime_type)) {
+    await processImage(ctx, doc);
+  } else {
+    ctx.reply("⚠️ Only JPEG/PNG images supported");
+  }
+});
+
+// ======================
+// 5. PDF GENERATION
+// ======================
 bot.command('convert', async (ctx) => {
   if (!ctx.session.images?.length) {
     return ctx.reply("⚠️ No images to convert");
@@ -95,45 +120,43 @@ bot.command('convert', async (ctx) => {
     pdfDoc.on('data', chunk => {
       chunks.push(chunk);
       pdfSize += chunk.length;
-      if (pdfSize > 45 * 1024 * 1024) { // Keep under 50MB
-        throw new Error("PDF approaching size limit - stopping early");
+      if (pdfSize > 45 * 1024 * 1024) { // Stay under 50MB
+        throw new Error("PDF too large - try fewer images");
       }
     });
 
-    // Process images sequentially to reduce memory pressure
-    for (const [index, imgBuffer] of ctx.session.images.entries()) {
+    for (const imgBuffer of ctx.session.images) {
       const img = await sharp(imgBuffer)
         .resize(800, 800, { fit: 'inside' })
         .toBuffer();
-      
       pdfDoc.image(img, 0, 0, { width: 595, height: 842 }); // A4 size
-      if (index < ctx.session.images.length - 1) pdfDoc.addPage();
+      if (ctx.session.images.indexOf(imgBuffer) < ctx.session.images.length - 1) {
+        pdfDoc.addPage();
+      }
     }
 
-    const pdfPromise = new Promise((resolve, reject) => {
+    await new Promise(resolve => {
       pdfDoc.on('end', resolve);
-      pdfDoc.on('error', reject);
       pdfDoc.end();
     });
 
-    await pdfPromise;
-    const pdfBuffer = Buffer.concat(chunks);
-
     await ctx.replyWithDocument({
-      source: pdfBuffer,
+      source: Buffer.concat(chunks),
       filename: `images_${Date.now()}.pdf`
     });
 
     ctx.session.images = [];
   } catch (error) {
-    console.error("PDF generation failed:", error);
+    console.error("PDF error:", error);
     ctx.reply(`❌ PDF failed: ${error.message}\nTry with fewer images.`);
   }
 });
 
-// Render-required Express setup
+// ======================
+// 6. SERVER SETUP (RENDER)
+// ======================
 app.use(express.json());
-app.post(`/webhook`, async (req, res) => {
+app.post('/webhook', async (req, res) => {
   try {
     await bot.handleUpdate(req.body);
     res.status(200).end();
@@ -143,34 +166,29 @@ app.post(`/webhook`, async (req, res) => {
   }
 });
 
-// Health check endpoint for Render monitoring
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
-    sessions: Object.keys(userSessions).length 
-  });
-});
+app.get('/health', (req, res) => res.status(200).json({ status: 'OK' }));
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Bot running on port ${PORT}`);
   if (process.env.RENDER) {
-    console.log("⚡ Render.com detected - webhook mode active");
-    // Auto-set webhook on Render
     const webhookUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/webhook`;
     bot.telegram.setWebhook(webhookUrl)
-      .then(() => console.log(`Webhook set to ${webhookUrl}`))
-      .catch(err => console.error("Webhook setup failed:", err));
-  } else {
-    console.log("🔌 Development mode - using polling");
-    bot.launch();
+      .then(() => console.log(`Webhook set: ${webhookUrl}`))
+      .catch(err => console.error("Webhook error:", err));
   }
 });
 
-// Clean up on exit
+// ======================
+// 7. ERROR HANDLING
+// ======================
+bot.catch((err, ctx) => {
+  console.error(`Bot error:`, err);
+  ctx.reply("❌ Bot error. Try again later.");
+});
+
 process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down gracefully');
+  console.log('🛑 Shutting down');
   bot.stop();
   process.exit(0);
 });
