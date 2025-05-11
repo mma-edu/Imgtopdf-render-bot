@@ -1,7 +1,7 @@
 const { Telegraf } = require('telegraf');
 const sharp = require('sharp');
 const PDFDocument = require('pdfkit');
-const axios = require('axios'); // Replaced node-fetch with axios
+const axios = require('axios');
 const express = require('express');
 
 const app = express();
@@ -47,12 +47,20 @@ bot.command('start', (ctx) => {
   ctx.reply(
     "📸➡️📄 *Image to PDF Bot*\n\n" +
     "Send me images (JPEG/PNG) to convert to PDF!\n\n" +
-    "• Max 50 images\n• Need to convert more than 50 images?\n• Visit our website for unlimited conversions:\n 👉 imagestopdf.vercel.app\n • /convert when ready\n• /cancel to clear\n• /help for instructions",
+    "• Max 50 images\n• Need to convert more? Visit:\n  👉 imagestopdf.vercel.app\n• /convert when ready\n• /cancel to clear\n• /help for instructions",
     { parse_mode: 'Markdown' }
   );
 });
 
-bot.command('help', (ctx) => ctx.reply("Send images → /convert → Get PDF\nMax 50 images", { parse_mode: 'Markdown' }));
+bot.command('help', (ctx) => ctx.reply(
+  "🆘 *How to use:*\n\n" +
+  "1. Send me images (as photos or files)\n" +
+  "2. When ready, type /convert\n" +
+  "• Max 50 images per PDF\n" +
+  "• For unlimited conversions: imagestopdf.vercel.app",
+  { parse_mode: 'Markdown' }
+));
+
 bot.command('cancel', (ctx) => {
   ctx.session.images = [];
   ctx.reply("🗑️ Cleared all images!");
@@ -69,22 +77,25 @@ async function downloadImage(url) {
 async function processImage(ctx, file) {
   try {
     if (ctx.session.images.length >= MAX_IMAGES) {
-      return ctx.reply(`⚠️ Max ${MAX_IMAGES} images reached. Use /convert now.`);
+      return ctx.reply(`⚠️ Max ${MAX_IMAGES} images reached. Use /convert now or visit imagestopdf.vercel.app for more.`);
     }
 
     const fileUrl = await ctx.telegram.getFileLink(file.file_id);
     const imageBuffer = await downloadImage(fileUrl.href);
     
-    const processedImage = await sharp(imageBuffer)
-      .resize(1200, 1200, { fit: 'inside' })
-      .jpeg({ quality: 85 })
-      .toBuffer();
+    // Store both buffer and metadata
+    const metadata = await sharp(imageBuffer).metadata();
+    ctx.session.images.push({
+      buffer: imageBuffer,
+      width: metadata.width,
+      height: metadata.height,
+      format: metadata.format
+    });
 
-    ctx.session.images.push(processedImage);
-    ctx.reply(`✅ Added image /convert (${ctx.session.images.length}/${MAX_IMAGES})`);
+    ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES})\nType /convert when ready`);
   } catch (error) {
     console.error("Image error:", error);
-    ctx.reply("❌ Failed to process image. Try another file.");
+    ctx.reply("❌ Failed to process image. Please try another file.");
   }
 }
 
@@ -94,8 +105,10 @@ bot.on('photo', async (ctx) => {
 
 bot.on('document', async (ctx) => {
   const doc = ctx.message.document;
-  const validTypes = ['image/jpeg', 'image/png'];
-  if (validTypes.includes(doc.mime_type)) {
+  const validTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+  const fileExt = doc.file_name?.split('.').pop()?.toLowerCase();
+  
+  if (validTypes.includes(doc.mime_type) || (fileExt && ['jpg', 'jpeg', 'png'].includes(fileExt))) {
     await processImage(ctx, doc);
   } else {
     ctx.reply("⚠️ Only JPEG/PNG images supported");
@@ -103,7 +116,7 @@ bot.on('document', async (ctx) => {
 });
 
 // ======================
-// 5. PDF GENERATION
+// 5. PDF GENERATION (PRESERVING ORIGINAL DIMENSIONS)
 // ======================
 bot.command('convert', async (ctx) => {
   if (!ctx.session.images?.length) {
@@ -113,26 +126,30 @@ bot.command('convert', async (ctx) => {
   ctx.reply("⏳ Creating PDF...");
 
   try {
-    const pdfDoc = new PDFDocument({ margin: 0 });
+    const pdfDoc = new PDFDocument({ autoFirstPage: false });
     const chunks = [];
     let pdfSize = 0;
 
     pdfDoc.on('data', chunk => {
       chunks.push(chunk);
       pdfSize += chunk.length;
-      if (pdfSize > 45 * 1024 * 1024) { // Stay under 50MB
-        throw new Error("PDF too large - try fewer images");
+      if (pdfSize > 45 * 1024 * 1024) {
+        throw new Error("PDF reached 45MB limit - try with fewer images");
       }
     });
 
-    for (const imgBuffer of ctx.session.images) {
-      const img = await sharp(imgBuffer)
-        .resize(800, 800, { fit: 'inside' })
-        .toBuffer();
-      pdfDoc.image(img, 0, 0, { width: 595, height: 842 }); // A4 size
-      if (ctx.session.images.indexOf(imgBuffer) < ctx.session.images.length - 1) {
-        pdfDoc.addPage();
-      }
+    for (const imgData of ctx.session.images) {
+      // Create page matching image dimensions (in PDF points: 1pt = 1/72 inch)
+      const pageWidth = imgData.width * 72 / 96; // Convert pixels to points (assuming 96dpi)
+      const pageHeight = imgData.height * 72 / 96;
+      
+      pdfDoc.addPage({ size: [pageWidth, pageHeight] });
+      pdfDoc.image(imgData.buffer, 0, 0, { 
+        width: pageWidth,
+        height: pageHeight,
+        align: 'center',
+        valign: 'center'
+      });
     }
 
     await new Promise(resolve => {
@@ -148,12 +165,12 @@ bot.command('convert', async (ctx) => {
     ctx.session.images = [];
   } catch (error) {
     console.error("PDF error:", error);
-    ctx.reply(`❌ PDF failed: ${error.message}\nTry with fewer images.`);
+    ctx.reply(`❌ PDF creation failed: ${error.message}\nTry with fewer images or visit imagestopdf.vercel.app`);
   }
 });
 
 // ======================
-// 6. SERVER SETUP (RENDER)
+// 6. SERVER SETUP (RENDER COMPATIBLE)
 // ======================
 app.use(express.json());
 app.post('/webhook', async (req, res) => {
@@ -184,11 +201,11 @@ app.listen(PORT, () => {
 // ======================
 bot.catch((err, ctx) => {
   console.error(`Bot error:`, err);
-  ctx.reply("❌ Bot error. Try again later.");
+  ctx.reply("❌ Bot encountered an error. Please try again later.");
 });
 
 process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down');
+  console.log('🛑 Shutting down gracefully');
   bot.stop();
   process.exit(0);
 });
