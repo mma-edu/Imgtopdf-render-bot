@@ -47,7 +47,7 @@ bot.command('start', (ctx) => {
   ctx.reply(
     "📸➡️📄 *Image to PDF Bot*\n\n" +
     "Send me images (JPEG/PNG) to convert to PDF!\n\n" +
-    "• Max 50 images\n• /convert when ready\n• /cancel to clear",
+    "• Max 50 images\n• Need to convert more than 50 images?\n• Visit our website for unlimited conversions:\n 👉 imagestopdf.vercel.app\n • /convert when ready\n• /cancel to clear\n• /help for instructions",
     { parse_mode: 'Markdown' }
   );
 });
@@ -81,7 +81,7 @@ async function processImage(ctx, file) {
       .toBuffer();
 
     ctx.session.images.push(processedImage);
-    ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES})`);
+    ctx.reply(`✅ Added image /convert (${ctx.session.images.length}/${MAX_IMAGES})`);
   } catch (error) {
     console.error("Image error:", error);
     ctx.reply("❌ Failed to process image. Try another file.");
